@@ -32,6 +32,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static android.content.ContentValues.TAG;
 
@@ -50,8 +51,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 	private ServerSocket serverSocket;
 	private String myPort;
 	private String myHash;
-	SimpleDynamoActivity ref;
+
+	ReentrantLock synchLock;
+
 	private volatile boolean synchOn;
+	private volatile boolean acceptInsertOn;
 
 	@Override
 	public int delete(Uri uri, String selection, String[] selectionArgs) {
@@ -128,9 +132,13 @@ public class SimpleDynamoProvider extends ContentProvider {
 			message.put("type","insert");
 			for(String t:targets) {
 				Log.d(TAG,"Forwarding insert to:"+t+":"+ring.get(t));
-				new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t));
+				new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t)).get();
 			}
 		} catch (JSONException e) {
+			e.printStackTrace();
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		} catch (ExecutionException e) {
 			e.printStackTrace();
 		}
 
@@ -202,6 +210,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 	@Override
 	public boolean onCreate() {
 		Log.e(TAG,"oncreate");
+		synchLock = new ReentrantLock();
+		synchLock.lock();
 		TelephonyManager tel = (TelephonyManager) getContext().getSystemService(Context.TELEPHONY_SERVICE);
 		String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
 		myPort = String.valueOf(Integer.parseInt(portStr)*2);
@@ -214,7 +224,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 		mPrefs = getContext().getSharedPreferences(SHARED_PREF_FILENAME, Context.MODE_PRIVATE);//multiprocess rquired?
 		mAdminPrefs = getContext().getSharedPreferences(ADMIN_SHARED_PREF_FILENAME, Context.MODE_PRIVATE);//multiprocess rquired?
-//		mPrefs.edit().clear().apply();
+
 
 		ring = new TreeMap<String, String>();
 		ring.put(Util.genHash("5554"),"11108");
@@ -228,6 +238,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			Log.w(TAG,k+":"+ring.get(k));
 		}
 
+		acceptInsertOn = false;
 		synchOn = false;
 
 
@@ -253,6 +264,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 				Log.d(TAG,"No data found. Deletes had presumably occured. Not synching");
 			}
 		}
+		synchLock.unlock();	//at this point i have completed synch if any
 		return true;
 	}
 
@@ -376,10 +388,17 @@ public class SimpleDynamoProvider extends ContentProvider {
 		MatrixCursor cursor = new MatrixCursor(new String[]{COLUMN_KEY,COLUMN_VALUE});
 		if(selection.equals("@")) {
 			//return everything in this node
+			synchLock.lock();
 			Map<String, String> all = (Map<String, String>) mPrefs.getAll();
 			for(String k:all.keySet()) {
 				cursor.addRow(new Object[]{k,all.get(k)});
 			}
+
+			if(acceptInsertOn) {
+				Log.e(TAG,"@ query("+ selection +")while accepting insert");
+			}
+			synchLock.unlock();
+
 		} else if(selection.equals("*")) {
 			//everything in dynamo
 			JSONObject message = new JSONObject();
@@ -409,11 +428,24 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 
 		} else {	//local query for one object
+
+			if(acceptInsertOn) {
+				Log.e(TAG,"@ query while accepting insert");
+			}
+
+			synchLock.lock();
+
 			Log.d(TAG,"Local query for "+selection);
 			String value = mPrefs.getString(selection,null);
+			//TODO: Regardless of whether we have the entry stored or not, lock here to wait for an insert to finish. This is basically to cover only case 1.(See end of cocde)
 			if(value!=null)
 				cursor.addRow(new Object[]{selection,value});
 			else {	//contact all target nodes. Return the one with the latest version
+
+				if(doesKeyBelongTo(Util.genHash(selection),myHash)) {
+					Log.e(TAG,"Query for "+ selection+", never stored in myself");
+				}
+
 				String[] targets = getTargets(Util.genHash(selection));
 				try {
 					JSONObject message = new JSONObject();
@@ -427,12 +459,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 						if(reply!=null) {
 							//TODO: Compare latestReply with reply and update latestReply to be the actual latest version of teh retrieved data..
 							latestReply = reply;	//value will be available in "content" key directly
+							cursor.addRow(new Object[]{selection,latestReply});
+							break;		//we first hit the coordinator, then the first replica, then the second. We break whenever we get something
 						}
 					}
-					if(latestReply==null) {
+					/*if(latestReply==null) {
 						Log.w(TAG,"Single query failed..none of the 3 targets responded with a value!");
-					}
-					cursor.addRow(new Object[]{selection,latestReply});
+					}*/
+
 				} catch (JSONException e) {
 					e.printStackTrace();
 				} catch (InterruptedException e) {
@@ -441,8 +475,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 					e.printStackTrace();
 				}
 			}
+
+			synchLock.unlock();
 		}
-		Log.d(TAG,"Returning "+cursor.getCount()+" items");
 		Log.d(TAG,"Returning "+cursor.getCount()+" items");
 		return cursor;
 	}
@@ -527,7 +562,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 						JSONObject received = new JSONObject(str);
 						sender = received.getString("sender");
 						if(received.getString("type").equals("insert")) {
+							acceptInsertOn = true;
 							storeLocally(received.getString("key"),received.getString("value"));
+							acceptInsertOn = false;
 							JSONObject obj = new JSONObject();
 							obj.put("type","insert_reply");
 							writer.println(obj.toString());
@@ -612,3 +649,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 
 }
+
+/**
+ Case 1:
+ 5556 has an old value. Thread 1 inserts new value(same key) to 5556. Just a few ms later, Thread 2 queries that key. If the Accept() operation for servicing Thread 1 hadn't been executed,
+ then the query will return a stale value. Having a lock will avoid this corner case. Of course, this will not help the cause if there was another Thread 0 before Thread 1 who had sent
+ something to 5556. In this case, the sequence would be something like: Thread 0 insert-->THread 2 query(stale!!)-->Thread 1 insert(new). We do not intent to cover this case - we assume
+ that this condition wont occur
+
+ **/
