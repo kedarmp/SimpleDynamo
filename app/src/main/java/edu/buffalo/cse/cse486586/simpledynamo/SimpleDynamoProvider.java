@@ -8,11 +8,8 @@ import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.AsyncTask;
-import android.os.Handler;
-import android.os.Looper;
 import android.telephony.TelephonyManager;
 import android.util.Log;
-import android.widget.Toast;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -35,19 +32,18 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.locks.ReentrantLock;
 
 import static android.content.ContentValues.TAG;
 
 public class SimpleDynamoProvider extends ContentProvider {
 
-	private ReentrantLock ringLock;
 	private SharedPreferences mPrefs = null;
 	private final static String SHARED_PREF_FILENAME = "edu.buffalo.cse.cse486586.dynamo.sharedpref";
+	private SharedPreferences mAdminPrefs = null;
+	private final static String ADMIN_SHARED_PREF_FILENAME = "edu.buffalo.cse.cse486586.dynamo.adminsharedpref";
 
 	public final static String COLUMN_KEY = "key";
 	public final static String COLUMN_VALUE = "value";
-
 
 	private static final int LISTEN_PORT = 10000;
 	private TreeMap<String, String> ring;
@@ -55,9 +51,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 	private String myPort;
 	private String myHash;
 	SimpleDynamoActivity ref;
+	private volatile boolean synchOn;
 
 	@Override
 	public int delete(Uri uri, String selection, String[] selectionArgs) {
+		Log.d(TAG,"Delete: "+selection);
 		if(selection.equals("*")) {
 			//delete ALL k-v in entire DHT
 			/*JSONObject deleteRequest = new JSONObject();
@@ -81,7 +79,23 @@ public class SimpleDynamoProvider extends ContentProvider {
 			//delete all k=v stored locally
 			mPrefs.edit().clear().apply();
 		} else {
-			mPrefs.edit().remove(selection).apply();
+			if(mPrefs.contains(selection)) {
+				mPrefs.edit().remove(selection).apply();
+				Log.d(TAG,"Delete: key found. WIll be deleted");
+
+			}
+			else {
+				Log.d(TAG,"Delete: key not found!");
+			}
+//			int count = mPrefs.getAll().size();
+			//Observed problem: Due to apply(), which is asynchronous, sometimes, a future query to @ will return "freshstart" pref, which is not what we want.
+			//One solution is to use commit() . Another is to use a different pref file for freshstart alone. See if commit() takes a performance hit, else do option B.
+			/*Log.d(TAG,count + " items remaining after delete");
+			if(count == 1) {
+				for(String k:mPrefs.getAll().keySet()) {
+					Log.d(TAG,k+":"+mPrefs.getString(k,null));
+				}
+			}*/
 		}
 		return 0;
 	}
@@ -112,24 +126,48 @@ public class SimpleDynamoProvider extends ContentProvider {
 			message.put("value",value);
 			message.put("sender",myPort);
 			message.put("type","insert");
-			ringLock.lock();
 			for(String t:targets) {
 				Log.d(TAG,"Forwarding insert to:"+t+":"+ring.get(t));
 				new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t));
 			}
-			ringLock.unlock();
 		} catch (JSONException e) {
 			e.printStackTrace();
 		}
 
-
-
-
 		return uri;
 	}
 
+	/**
+	 * Returns the coordinator for which this is a replica of AND the replica of this node(as a coordinator)
+	 * This assumes that when a recovery occurs, all 5 nodes are always alive
+	 * @param key
+	 * @return target[2]. target[0] contains the node predecessor of the predecessor, target[1] contains the successor
+	 */
+	public String[] getSynchTargets(String key) {
+		//populate 3 nodes to sen data to
+		String [] targets = new String[3];
+		//get the coordinator of this replica (two steps behind)
+		//go one step behind
+		targets[0] = ring.lowerKey(key);
+		if(targets[0] == null) {	//key is the lowest
+			targets[0] = ring.lastKey();
+		}
+		//go another step behind
+		targets[1] = ring.lowerKey(targets[0]);
+		if(targets[1] == null) {	//key is the lowest
+			targets[1] = ring.lastKey();
+		}
+
+		//get the successor(key's replica)
+		targets[2] = ring.higherKey(key);
+		if(targets[2] == null)	//target[0] is last
+			targets[2] = ring.firstKey();
+
+		return targets;
+	}
+
+
 	public String[] getTargets(String key) {
-		ringLock.lock();
 		//populate 3 nodes to sen data to
 		String [] targets = new String[3];
 		for(String k:ring.keySet()) {
@@ -150,10 +188,13 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 
 		//send message to coordinator and its successors (assuming no failures)
-		if(ring.higherKey(targets[0]) == null)	//target[0] is last
+		targets[1] = ring.higherKey(targets[0]);
+		if(targets[1] == null)	//target[0] is last
 			targets[1] = ring.firstKey();
-			targets[2] = ring.higherKey(targets[1]);
-		ringLock.unlock();
+
+		targets[2] = ring.higherKey(targets[1]);
+		if(targets[2] == null)
+			targets[2] = ring.firstKey();
 		return targets;
 	}
 
@@ -161,12 +202,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 	@Override
 	public boolean onCreate() {
 		Log.e(TAG,"oncreate");
-		ringLock = new ReentrantLock();
 		TelephonyManager tel = (TelephonyManager) getContext().getSystemService(Context.TELEPHONY_SERVICE);
 		String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
 		myPort = String.valueOf(Integer.parseInt(portStr)*2);
 		myHash = Util.genHash(String.valueOf(Integer.parseInt(portStr)));
-
 		try {
 			serverSocket = new ServerSocket(LISTEN_PORT);
 			new AcceptMessages().execute();
@@ -174,6 +213,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 			e.printStackTrace();
 		}
 		mPrefs = getContext().getSharedPreferences(SHARED_PREF_FILENAME, Context.MODE_PRIVATE);//multiprocess rquired?
+		mAdminPrefs = getContext().getSharedPreferences(ADMIN_SHARED_PREF_FILENAME, Context.MODE_PRIVATE);//multiprocess rquired?
+//		mPrefs.edit().clear().apply();
 
 		ring = new TreeMap<String, String>();
 		ring.put(Util.genHash("5554"),"11108");
@@ -187,17 +228,30 @@ public class SimpleDynamoProvider extends ContentProvider {
 			Log.w(TAG,k+":"+ring.get(k));
 		}
 
+		synchOn = false;
+
 
 		//determine if this is a crash start or fresh start
-		if(mPrefs.getString("freshstart",null) == null) {
+		if(mAdminPrefs.getString("freshstart",null) == null) {
 			//fresh start. Mark it as such bu storing someting in this key
-			mPrefs.edit().putString("freshstart","yes").commit();
+			mAdminPrefs.edit().putString("freshstart","yes").commit();
 		}
 		else {
 			//recovering from a crash. Remove from prefs and start synch
 //			mPrefs.edit().remove("freshstart").commit();
-			Log.d(TAG, "Starting synch after recovery");
-			synch();
+
+			//Synch only if we previously had at least one KV pair. Otherwise, we are recovering after a delete. in which case, we don't want to synch
+			if(mPrefs.getAll().size()>0) {
+				Log.d(TAG, "Starting synch after recovery");
+
+				synchOn = true;
+				synch();
+				synchOn = false;
+
+			}
+			else {
+				Log.d(TAG,"No data found. Deletes had presumably occured. Not synching");
+			}
 		}
 		return true;
 	}
@@ -211,8 +265,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 		try {
 			Map<String, String> all = (Map<String, String>) mPrefs.getAll();
 			for(String k:all.keySet()) {
-				if(k.equals("freshstart"))
-					continue;
 				JSONObject obj = new JSONObject();
 				obj.put("key",k);
 				obj.put("value",all.get(k));
@@ -224,30 +276,85 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return local.toString();
 	}
 
+	/**
+	 *
+	 * Returns a JSON array of key value pairs of my own data (not data in myself that is a replica of somebody else). This will be called by replicas of us.(via AcceptMessage of course)
+	 * @return
+	 * @param owner: Must be hashed!
+	 */
+	private String fetchDataBelongingTo(String owner) {
+//		String previous = ring.lowerKey(myHash);
+//		if(previous == null)
+//			previous = ring.lastKey();
+
+		JSONArray local = new JSONArray();
+		try {
+			Map<String, String> all = (Map<String, String>) mPrefs.getAll();
+			for(String k:all.keySet()) {
+				if(!doesKeyBelongTo(Util.genHash(k),owner)) {		//NOTE: owner must be hashed from caller of this method.
+					Log.w(TAG,k+" doesnt belong to "+owner);
+					continue;
+				}
+				JSONObject obj = new JSONObject();
+				obj.put("key",k);
+				obj.put("value",all.get(k));
+				local.put(obj);
+			}
+		} catch (JSONException e) {
+			e.printStackTrace();
+		}
+		return local.toString();
+	}
+
+
+	private boolean doesKeyBelongTo(String key, String node) {	//both parameters are assumed to be hashed.
+		String prev = ring.lowerKey(node);
+		if(prev == null)
+			prev = ring.lastKey();
+		//find if 'k' falls between prev and node includingn the border cases
+		if(node.equals(ring.firstKey())) {
+			if(key.compareTo(prev)>0 || key.compareTo(node)<=0)
+				return true;
+		}
+		else if(prev.compareTo(key)<0 && key.compareTo(node)<=0)
+			return true;
+
+		return false;
+	}
+
 	public void synch() {
 		//synch from both next server.
 		// Same as query * except this time we query only our next 2 guys, combine results and store them in our sharedprefs
-		String[] targets = getTargets(myHash);
+		String[] targets = getSynchTargets(myHash);
+
 
 		JSONObject message = new JSONObject();
 		try {
-			message.put("type","query");
-			message.put("extra","iamback");
+			message.put("type","synch");
 			message.put("sender", myPort);
 			HashMap<String,String> synched = new HashMap<String, String>();
-			for(String t:targets) {
-				String result = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR,message.toString(),ring.get(t)).get();
-				if(result!=null) {
+			for(int j=0;j<targets.length;j++) {
+				String result;
+				if(j==0 || j==1) {		//getting data from predecessors
+					message.put("role","slave");	//"role" is our role.
+					result = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(targets[j])).get();
+				} else {
+					message.put("role","peer");		//this is our replica(first successor). So, we're its coordinator
+					result = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(targets[j])).get();
+				}
+
+				if (result != null) {
 					//add contents of result into cursor
 					JSONArray keyValus = new JSONArray(result);
-					Log.d(TAG,"Synch: Received "+keyValus.length()+" entries from " + ring.get(t));
-					for(int i=0;i<keyValus.length();i++) {
+					Log.d(TAG, "Synch: Received " + keyValus.length() + " entries from " + ring.get(targets[j]));
+					for (int i = 0; i < keyValus.length(); i++) {
 						JSONObject obj = keyValus.getJSONObject(i);
-						if(synched.get(obj.getString("key"))!=null && !synched.get(obj.getString("key")).equals(obj.getString("value")) ) {
-							Log.w(TAG,"Different values for key:" + obj.getString("key"));
+						if (synched.get(obj.getString("key")) != null && !synched.get(obj.getString("key")).equals(obj.getString("value"))) {
+							Log.w(TAG, "Different values for key:" + obj.getString("key"));
 						}
 						//TODO: Compare versions somehow. synched is unused right now..
-						storeLocally(obj.getString("key"),obj.getString("value"));
+
+						storeLocally(obj.getString("key"), obj.getString("value"));
 					}
 				}
 			}
@@ -265,13 +372,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 	public Cursor query(Uri uri, String[] projection, String selection,
 						String[] selectionArgs, String sortOrder) {
 		// TODO Auto-generated method stub
+		Log.d(TAG,"Query: selection:"+selection);
 		MatrixCursor cursor = new MatrixCursor(new String[]{COLUMN_KEY,COLUMN_VALUE});
 		if(selection.equals("@")) {
 			//return everything in this node
 			Map<String, String> all = (Map<String, String>) mPrefs.getAll();
 			for(String k:all.keySet()) {
-				if(k.equals("freshstart"))
-					continue;
 				cursor.addRow(new Object[]{k,all.get(k)});
 			}
 		} else if(selection.equals("*")) {
@@ -280,7 +386,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 			try {
 				message.put("type","query");
 				message.put("sender", myPort);
-				ringLock.lock();
 				for(String t:ring.keySet()) {
 					String result = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR,message.toString(),ring.get(t)).get();
 					if(result!=null) {
@@ -293,7 +398,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 						}
 					}
 				}
-				ringLock.unlock();
 				//combine result
 			} catch (JSONException e) {
 				e.printStackTrace();
@@ -317,7 +421,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 					message.put("sender",myPort);
 					message.put("type","singlequery");
 					String latestReply = null;
-					ringLock.lock();
 					for(String t:targets) {
 						Log.d(TAG,"Forwarding query to:"+t+":"+ring.get(t));
 						String reply = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t)).get();
@@ -326,7 +429,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 							latestReply = reply;	//value will be available in "content" key directly
 						}
 					}
-					ringLock.unlock();
 					if(latestReply==null) {
 						Log.w(TAG,"Single query failed..none of the 3 targets responded with a value!");
 					}
@@ -340,7 +442,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 			}
 		}
-
+		Log.d(TAG,"Returning "+cursor.getCount()+" items");
+		Log.d(TAG,"Returning "+cursor.getCount()+" items");
 		return cursor;
 	}
 
@@ -350,49 +453,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		mPrefs.edit().putString(key,value).apply();
 	}
 
-	//Only for thread safety do we bother running this on the main thread
-	private void removeFromRing(final String avdPort) {
-		Handler mainHandler = new Handler(Looper.getMainLooper());
-		Runnable myRunnable = new Runnable() {
-			@Override
-			public void run() {
-				String correspondingKey = null;
-				for(String k:ring.keySet()) {
-					if(ring.get(k).equals(avdPort)) {
-						correspondingKey = k;
-						break;
-					}
-				}
-				if(correspondingKey!=null) {
-					ringLock.lock();
-					ring.remove(correspondingKey);
-					ringLock.unlock();
-					Log.w(TAG, avdPort + " removed from ring");
-					Toast.makeText(getContext(), avdPort + " removed from ring", Toast.LENGTH_SHORT).show();
-				}
-				else {
-					Log.e(TAG, "Key not found in ring");
-				}
-			}
-		};
-		mainHandler.post(myRunnable);
-	}
 
-	private void addToRing(final String avdPort) {
-		Handler mainHandler = new Handler(Looper.getMainLooper());
-		Runnable myRunnable = new Runnable() {
-			@Override
-			public void run() {
-				int port = Integer.parseInt(avdPort)/2;	//55xx number
-				ringLock.lock();
-				ring.put(Util.genHash(String.valueOf(port)),avdPort);
-				ringLock.unlock();
-				Log.w(TAG, avdPort + " added to  ring");
-				Toast.makeText(getContext(), avdPort + " added to ring", Toast.LENGTH_SHORT).show();
-			}
-		};
-		mainHandler.post(myRunnable);
-	}
 	private class SendMessage extends AsyncTask<String,Void,String> {
 
 		@Override
@@ -417,10 +478,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 					else if(obj.get("type").equals("singlequery_reply")) {
 						return obj.getString("content");
 					}
+					else if(obj.get("type").equals("synch_reply")) {
+						return obj.getString("content");
+					}
 				}
 				else {
-					Log.v(TAG,"SendMessage received null");
-					removeFromRing(strings[1]);
+					Log.v(TAG,strings[1] + "failed");
 				}
 				writer.close();
 				r.close();
@@ -429,20 +492,15 @@ public class SimpleDynamoProvider extends ContentProvider {
 			} catch (UnknownHostException ex) {
 				//ex.printStackTrace();
 				Log.e(TAG,strings[1] + " failed");
-				removeFromRing(strings[1]);
 			} catch(SocketTimeoutException ex) {
 				Log.e(TAG,strings[1] + " failed");
-				removeFromRing(strings[1]);
 			} catch(StreamCorruptedException ex) {
 				Log.e(TAG,strings[1] + " failed");
-				removeFromRing(strings[1]);
 			} catch (EOFException ex) {
 				Log.e(TAG,strings[1] + " failed");
-				removeFromRing(strings[1]);
 			}  catch (IOException e) {
 				//e.printStackTrace();
 				Log.e(TAG,strings[1] + " failed");
-				removeFromRing(strings[1]);
 			} catch (JSONException e) {
 				e.printStackTrace();
 			}
@@ -471,13 +529,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 						if(received.getString("type").equals("insert")) {
 							storeLocally(received.getString("key"),received.getString("value"));
 							JSONObject obj = new JSONObject();
-							obj.put("type","bullshitack");
+							obj.put("type","insert_reply");
 							writer.println(obj.toString());
 						}
 						else if(received.getString("type").equals("query")) {
-							if("iamback".equals(received.optString("extra"))) {
-								//add sender back to the ring
-								addToRing(sender);
+							if(synchOn) {
+								Log.e(TAG,"Query received while synch on");
 							}
 							JSONObject reply = new JSONObject();
 							reply.put("content",fetchLocalData());
@@ -488,9 +545,30 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 						}
 						else if(received.getString("type").equals("singlequery")) {
+							if(synchOn) {
+								Log.e(TAG,"single Query received while synch on");
+							}
 							JSONObject reply = new JSONObject();
 							reply.put("content",mPrefs.getString(received.getString("key"),null));
 							reply.put("type","singlequery_reply");
+							writer.println(reply.toString());
+
+						}
+						else if(received.getString("type").equals("synch")) {
+							if(synchOn) {
+								Log.e(TAG,"Synch request received while synch on");
+							}
+							Log.d(TAG,"Synch request from "+sender);
+							String returnedData;
+							if(received.getString("role").equals("slave"))	//role is the requestors role.
+								returnedData = fetchDataBelongingTo(myHash);
+							else {				//peer
+								String senderHash = Util.genHash(String.valueOf(Integer.parseInt(sender)/2));
+								returnedData = fetchDataBelongingTo(senderHash);	//11XX /2 and then hash it
+							}
+							JSONObject reply = new JSONObject();
+							reply.put("content",returnedData);
+							reply.put("type","synch_reply");
 							writer.println(reply.toString());
 
 						}
@@ -501,7 +579,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 					}
 					else {
 						Log.v(TAG,"AcceptMessage received null");
-						removeFromRing(sender);
 					}
 
 					writer.close();
@@ -511,17 +588,13 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 			}catch(SocketTimeoutException ex) {
 				Log.e(TAG,"AcceptMessages:" + sender + " failed");
-				removeFromRing(sender);
 			} catch(StreamCorruptedException ex) {
 				Log.e(TAG,"AcceptMessages:" + sender + " failed");
-				removeFromRing(sender);
 			} catch (EOFException ex) {
 				Log.e(TAG,"AcceptMessages:" + sender + " failed");
-				removeFromRing(sender);
 			} catch(IOException e){
 //				e.printStackTrace();
 				Log.e(TAG,"AcceptMessages:" + sender + " failed");
-				removeFromRing(sender);
 			} catch (JSONException e) {
 				e.printStackTrace();
 			}
