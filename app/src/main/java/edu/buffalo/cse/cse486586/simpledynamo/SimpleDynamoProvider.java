@@ -32,6 +32,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static android.content.ContentValues.TAG;
 
@@ -52,6 +53,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 	private String myHash;
 	SimpleDynamoActivity ref;
 	private volatile boolean synchOn;
+	private ReentrantLock myLock;
 
 	@Override
 	public int delete(Uri uri, String selection, String[] selectionArgs) {
@@ -128,9 +130,15 @@ public class SimpleDynamoProvider extends ContentProvider {
 			message.put("type","insert");
 			for(String t:targets) {
 				Log.d(TAG,"Forwarding insert to:"+t+":"+ring.get(t));
-				new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t));
+				String ret = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t)).get();
+				if(ret == null)
+					Log.e(TAG, "Some error occured(?) while sending to "+ring.get(t));
 			}
 		} catch (JSONException e) {
+			e.printStackTrace();
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		} catch (ExecutionException e) {
 			e.printStackTrace();
 		}
 
@@ -202,6 +210,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 	@Override
 	public boolean onCreate() {
 		Log.e(TAG,"oncreate");
+		myLock = new ReentrantLock();
+		myLock.lock();
 		TelephonyManager tel = (TelephonyManager) getContext().getSystemService(Context.TELEPHONY_SERVICE);
 		String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
 		myPort = String.valueOf(Integer.parseInt(portStr)*2);
@@ -253,6 +263,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 				Log.d(TAG,"No data found. Deletes had presumably occured. Not synching");
 			}
 		}
+
+		myLock.unlock();
 		return true;
 	}
 
@@ -354,8 +366,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 						}
 						//TODO: Compare versions somehow. synched is unused right now..
 
-						storeLocally(obj.getString("key"), obj.getString("value"));
+						storeLocally(obj.getString("key"), obj.getString("value"),true);
 					}
+				}
+				else {
+					Log.e(TAG,"Faile to synch from "+targets[j]);
 				}
 			}
 			//combine result
@@ -366,6 +381,20 @@ public class SimpleDynamoProvider extends ContentProvider {
 		} catch (ExecutionException e) {
 			e.printStackTrace();
 		}
+	}
+	class KeyCount {
+		String keyStr;
+		int count;
+
+		public KeyCount(String value) {
+			this.keyStr= value;
+			this.count = 1;
+		}
+		public KeyCount(String keyString, int count) {
+			this.keyStr = keyString;
+			this.count = count;
+		}
+
 	}
 
 	@Override
@@ -380,6 +409,61 @@ public class SimpleDynamoProvider extends ContentProvider {
 			for(String k:all.keySet()) {
 				cursor.addRow(new Object[]{k,all.get(k)});
 			}
+
+			//Get latest version of data from everynode
+
+			/*JSONObject message = new JSONObject();
+			try {
+				message.put("type","query");
+				message.put("sender", myPort);
+				HashMap<String, KeyCount> vals = new HashMap<String, KeyCount>();
+				for(String t:getTargets(myHash)) {
+					String result = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR,message.toString(),ring.get(t)).get();
+					if(result!=null) {
+						//add contents of result into cursor
+						Log.d(TAG,"Received "+result.length()+" entries from " + ring.get(t));
+						JSONArray keyValus = new JSONArray(result);
+						for(int i=0;i<keyValus.length();i++) {
+							JSONObject kv = keyValus.getJSONObject(i);
+							String key = kv.getString("key");
+							String value = kv.getString("value");
+							if(vals.containsKey(value)) {
+								vals.put(value,new KeyCount(key,vals.get(value).count+1));
+							}
+							else
+								vals.put(value,new KeyCount(key));
+						}
+					}
+				}
+
+				//combine result
+
+				//put KVs with count = 2 and 3
+				for(String v:vals.keySet()) {
+					if(vals.get(v).count==2 || vals.get(v).count==3) {
+						cursor.addRow(new Object[]{vals.get(v).keyStr, v});
+						vals.put(v,new KeyCount("",0));	//set the count of this entry to zero. Emptying the string is just saving some cpu cylces
+					}
+
+				}
+
+				//put KVs with count 1
+				for(String v:vals.keySet()) {
+					if(vals.get(v).count!=0) {
+						cursor.addRow(new Object[]{vals.get(v).keyStr, v});
+					}
+				}
+
+			} catch (JSONException e) {
+				e.printStackTrace();
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			} catch (ExecutionException e) {
+				e.printStackTrace();
+			}*/
+
+
+
 		} else if(selection.equals("*")) {
 			//everything in dynamo
 			JSONObject message = new JSONObject();
@@ -420,19 +504,40 @@ public class SimpleDynamoProvider extends ContentProvider {
 					message.put("key",selection);
 					message.put("sender",myPort);
 					message.put("type","singlequery");
-					String latestReply = null;
+					HashMap<String, Integer> replies = new HashMap<String, Integer>();
 					for(String t:targets) {
 						Log.d(TAG,"Forwarding query to:"+t+":"+ring.get(t));
 						String reply = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t)).get();
 						if(reply!=null) {
 							//TODO: Compare latestReply with reply and update latestReply to be the actual latest version of teh retrieved data..
-							latestReply = reply;	//value will be available in "content" key directly
+							if(replies.containsKey(reply))
+								replies.put(reply,replies.get(reply)+1);	//increment count
+							else
+								replies.put(reply,1);	//first value here
+
+							Log.d(TAG,"Received "+selection+":"+reply+" from "+ring.get(t));
+						}
+						else {
+							Log.e(TAG,"SingleQuery response null");
 						}
 					}
-					if(latestReply==null) {
-						Log.w(TAG,"Single query failed..none of the 3 targets responded with a value!");
+					boolean majorityFound = false;
+					for(String k:replies.keySet()) {
+						if(replies.get(k)>=2) {
+							cursor.addRow(new Object[]{selection,k});
+							majorityFound = true;
+							break;
+						}
 					}
-					cursor.addRow(new Object[]{selection,latestReply});
+					if(!majorityFound) {
+						Log.e(TAG,"No key had a count of 2 or 3. Which means all keys were different. TThis is a problem!");
+						//pick the first "key" which is the first value we receive and put into cursor. Putting something is probabilistically better than putting nothing at all
+						for(String k:replies.keySet()) {
+								cursor.addRow(new Object[]{selection,k});
+								break;
+						}
+					}
+
 				} catch (JSONException e) {
 					e.printStackTrace();
 				} catch (InterruptedException e) {
@@ -447,10 +552,17 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return cursor;
 	}
 
-	private void storeLocally(String key, String value) {
-		Log.w(TAG,"Message with hash:"+Util.genHash(key)+" stored locally("+myHash+")");
-		Log.w(TAG,"storeLocally KV:"+key+":"+value);
+	private void storeLocally(String key, String value, boolean insertedViaSynch) {
+		if(insertedViaSynch) {
+			Log.w(TAG,"(Synch)Message with hash:"+Util.genHash(key)+" stored locally("+myHash+")");
+			Log.w(TAG,"(Synch)storeLocally KV:"+key+":"+value);
+		}
+		else {
+			Log.w(TAG,"Message with hash:"+Util.genHash(key)+" stored locally("+myHash+")");
+			Log.w(TAG,"storeLocally KV:"+key+":"+value);
+		}
 		mPrefs.edit().putString(key,value).apply();
+
 	}
 
 
@@ -461,10 +573,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 			Log.d(TAG,myPort+ "sending to "+strings[1]);
 			String message = strings[0] + "\n";
 			int portNo = Integer.valueOf(strings[1]);
+			String returnVal = null;
 			try {
 				Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
 						portNo);
-				socket.setSoTimeout(1000);
+//				socket.setSoTimeout(1000);
 				PrintWriter writer = new PrintWriter(new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(),"UTF-8")),true);
 				BufferedReader r=new BufferedReader(new InputStreamReader(socket.getInputStream(),"UTF-8"));
 				writer.println(message);
@@ -472,18 +585,25 @@ public class SimpleDynamoProvider extends ContentProvider {
 				String rec = r.readLine();
 				if(rec!=null) {
 					JSONObject obj = new JSONObject(rec);
-					if(obj.get("type").equals("query_reply")) {
-						return obj.getString("content");
+					if(obj.get("type").equals("insert_reply")) {
+						returnVal  = "insert_reply";
+					}
+					else if(obj.get("type").equals("query_reply")) {
+						returnVal = obj.getString("content");
 					}
 					else if(obj.get("type").equals("singlequery_reply")) {
-						return obj.getString("content");
+						returnVal = obj.getString("content");
 					}
 					else if(obj.get("type").equals("synch_reply")) {
-						return obj.getString("content");
+						returnVal = obj.getString("content");
+					}
+					else {
+						Log.e(TAG,"Unknown reply type! SendMessage!:"+obj.toString());
+						returnVal = rec;
 					}
 				}
 				else {
-					Log.v(TAG,strings[1] + "failed");
+					Log.v(TAG,strings[1] + " failed. rec null");
 				}
 				writer.close();
 				r.close();
@@ -504,7 +624,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			} catch (JSONException e) {
 				e.printStackTrace();
 			}
-			return null;
+			return returnVal;
 		}
 	}
 
@@ -519,6 +639,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 			try {
 				while (true) {
 					Socket client = serverSocket.accept();
+					myLock.lock();
+					myLock.unlock();
 					Log.d(TAG,"Accepted connection");
 					BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream(),"UTF-8"));
 					PrintWriter writer = new PrintWriter(new BufferedWriter(new OutputStreamWriter(client.getOutputStream(),"UTF-8")),true);
@@ -527,7 +649,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 						JSONObject received = new JSONObject(str);
 						sender = received.getString("sender");
 						if(received.getString("type").equals("insert")) {
-							storeLocally(received.getString("key"),received.getString("value"));
+							storeLocally(received.getString("key"),received.getString("value"),false);
 							JSONObject obj = new JSONObject();
 							obj.put("type","insert_reply");
 							writer.println(obj.toString());
