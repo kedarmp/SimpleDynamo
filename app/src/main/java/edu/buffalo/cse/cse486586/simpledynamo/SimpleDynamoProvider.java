@@ -24,6 +24,7 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.io.StreamCorruptedException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -87,7 +88,30 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			}
 			else {
-				Log.d(TAG,"Delete: key not found!");
+				Log.d(TAG,"Delete: key not found! Propagating to others");
+
+				try {
+					JSONObject message = new JSONObject();
+					message.put("key",selection);
+					message.put("sender",myPort);
+					message.put("type","delete");
+					for(String t:getTargets(Util.genHash(selection))) {
+						Log.d(TAG,"Forwarding delete to:"+t+":"+ring.get(t));
+						String ret = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t)).get();
+						if(ret == null)
+							Log.e(TAG, "Some error occured(?) while sending delete to "+ring.get(t));
+						else
+							Log.w(TAG,"Deleted remotely");
+					}
+				} catch (JSONException e) {
+					e.printStackTrace();
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				} catch (ExecutionException e) {
+					e.printStackTrace();
+				}
+
+
 			}
 //			int count = mPrefs.getAll().size();
 			//Observed problem: Due to apply(), which is asynchronous, sometimes, a future query to @ will return "freshstart" pref, which is not what we want.
@@ -209,7 +233,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	@Override
 	public boolean onCreate() {
-		Log.e(TAG,"oncreate");
+		Log.e(TAG,"oncreate. Locking..ThreadID:"+Thread.currentThread().getId());
+		if(myLock != null) {
+			Log.e(TAG,"myLock wasnt null in onCreate!!!");
+		}
 		myLock = new ReentrantLock();
 		myLock.lock();
 		TelephonyManager tel = (TelephonyManager) getContext().getSystemService(Context.TELEPHONY_SERVICE);
@@ -217,9 +244,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 		myPort = String.valueOf(Integer.parseInt(portStr)*2);
 		myHash = Util.genHash(String.valueOf(Integer.parseInt(portStr)));
 		try {
-			serverSocket = new ServerSocket(LISTEN_PORT);
+			serverSocket = new ServerSocket();
+			serverSocket.setReuseAddress(true);
+			serverSocket.bind(new InetSocketAddress(LISTEN_PORT));
 			new AcceptMessages().execute();
-		} catch (IOException e) {
+		} catch (java.net.BindException e) {
+			Log.w(TAG,"Bindexception occurred. Continuing");
+		}
+		catch (IOException e) {
 			e.printStackTrace();
 		}
 		mPrefs = getContext().getSharedPreferences(SHARED_PREF_FILENAME, Context.MODE_PRIVATE);//multiprocess rquired?
@@ -239,7 +271,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 
 		synchOn = false;
-
 
 		//determine if this is a crash start or fresh start
 		if(mAdminPrefs.getString("freshstart",null) == null) {
@@ -263,10 +294,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 				Log.d(TAG,"No data found. Deletes had presumably occured. Not synching");
 			}
 		}
-
+		Log.e(TAG,"onCreate unlocking..");
 		myLock.unlock();
 		return true;
 	}
+
+
 
 	/**
 	 * Returns a JSON array of key value pairs of local data, converted to a String
@@ -337,6 +370,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 	public void synch() {
 		//synch from both next server.
 		// Same as query * except this time we query only our next 2 guys, combine results and store them in our sharedprefs
+		if(!myLock.isHeldByCurrentThread()) {
+			throw new AssertionError("Lock has to be held while synching");
+		}
 		String[] targets = getSynchTargets(myHash);
 
 
@@ -346,6 +382,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 			message.put("sender", myPort);
 			HashMap<String,String> synched = new HashMap<String, String>();
 			for(int j=0;j<targets.length;j++) {
+				if(!myLock.isHeldByCurrentThread()) {
+					throw new AssertionError("2_Lock has to be held while synching");
+				}
 				String result;
 				if(j==0 || j==1) {		//getting data from predecessors
 					message.put("role","slave");	//"role" is our role.
@@ -395,6 +434,18 @@ public class SimpleDynamoProvider extends ContentProvider {
 			this.count = count;
 		}
 
+	}
+
+	@Override
+	public void shutdown() {
+		Log.e(TAG,"Shutdown called contentprovider");
+		if(serverSocket!=null)
+			try {
+				serverSocket.close();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+		super.shutdown();
 	}
 
 	@Override
@@ -596,6 +647,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 					}
 					else if(obj.get("type").equals("synch_reply")) {
 						returnVal = obj.getString("content");
+					} else if(obj.get("type").equals("delete_reply")) {
+						returnVal = "delete_reply";
 					}
 					else {
 						Log.e(TAG,"Unknown reply type! SendMessage!:"+obj.toString());
@@ -639,7 +692,15 @@ public class SimpleDynamoProvider extends ContentProvider {
 			try {
 				while (true) {
 					Socket client = serverSocket.accept();
+					if(synchOn) {
+						Log.e(TAG,"AcceptMessage called while synch on");
+					}
+					Log.w(TAG,"Locking..current thread ID:"+Thread.currentThread().getId());
+					if(myLock.isLocked()) {
+						Log.e(TAG,"Yeeah, onCreate holds a lock to myLock");
+					}
 					myLock.lock();
+					Log.w(TAG,"Lock acquired");
 					myLock.unlock();
 					Log.d(TAG,"Accepted connection");
 					BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream(),"UTF-8"));
@@ -693,6 +754,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 							reply.put("type","synch_reply");
 							writer.println(reply.toString());
 
+						} else if(received.getString("type").equals("delete")) {
+							mPrefs.edit().remove(received.getString("key")).apply();
+							JSONObject obj = new JSONObject();
+							obj.put("type","delete_reply");
+							writer.println(obj.toString());
 						}
 
 						else {
