@@ -52,8 +52,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 	private ServerSocket serverSocket;
 	private String myPort;
 	private String myHash;
-	SimpleDynamoActivity ref;
-	private volatile boolean synchOn;
 	private ReentrantLock myLock;
 
 	@Override
@@ -81,38 +79,28 @@ public class SimpleDynamoProvider extends ContentProvider {
 		} else if(selection.equals("@")) {
 			//delete all k=v stored locally
 			mPrefs.edit().clear().apply();
-		} else {
-			if(mPrefs.contains(selection)) {
-				mPrefs.edit().remove(selection).apply();
-				Log.d(TAG,"Delete: key found. WIll be deleted");
-
-			}
-			else {
-				Log.d(TAG,"Delete: key not found! Propagating to others");
-
-				try {
-					JSONObject message = new JSONObject();
-					message.put("key",selection);
-					message.put("sender",myPort);
-					message.put("type","delete");
-					for(String t:getTargets(Util.genHash(selection))) {
-						Log.d(TAG,"Forwarding delete to:"+t+":"+ring.get(t));
-						String ret = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t)).get();
-						if(ret == null)
-							Log.e(TAG, "Some error occured(?) while sending delete to "+ring.get(t));
-						else
-							Log.w(TAG,"Deleted remotely");
-					}
-				} catch (JSONException e) {
-					e.printStackTrace();
-				} catch (InterruptedException e) {
-					e.printStackTrace();
-				} catch (ExecutionException e) {
-					e.printStackTrace();
+		} else {		//delete from 3 avds
+			try {
+				JSONObject message = new JSONObject();
+				message.put("key",selection);
+				message.put("sender",myPort);
+				message.put("type","delete");
+				for(String t:getTargets(Util.genHash(selection))) {
+					Log.d(TAG,"Forwarding delete to:"+t+":"+ring.get(t));
+					String ret = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t)).get();
+					if(ret == null)
+						Log.e(TAG, "Some error occured(?) while sending delete to "+ring.get(t));
+					else
+						Log.w(TAG,"Deleted remotely");
 				}
-
-
+			} catch (JSONException e) {
+				e.printStackTrace();
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			} catch (ExecutionException e) {
+				e.printStackTrace();
 			}
+
 //			int count = mPrefs.getAll().size();
 			//Observed problem: Due to apply(), which is asynchronous, sometimes, a future query to @ will return "freshstart" pref, which is not what we want.
 			//One solution is to use commit() . Another is to use a different pref file for freshstart alone. See if commit() takes a performance hit, else do option B.
@@ -270,7 +258,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 			Log.w(TAG,k+":"+ring.get(k));
 		}
 
-		synchOn = false;
 
 		//determine if this is a crash start or fresh start
 		if(mAdminPrefs.getString("freshstart",null) == null) {
@@ -278,16 +265,57 @@ public class SimpleDynamoProvider extends ContentProvider {
 			mAdminPrefs.edit().putString("freshstart","yes").commit();
 		}
 		else {
-			//recovering from a crash. Remove from prefs and start synch
-//			mPrefs.edit().remove("freshstart").commit();
-
 			//Synch only if we previously had at least one KV pair. Otherwise, we are recovering after a delete. in which case, we don't want to synch
 			if(mPrefs.getAll().size()>0) {
 				Log.d(TAG, "Starting synch after recovery");
 
-				synchOn = true;
-				synch();
-				synchOn = false;
+				String[] targets = getSynchTargets(myHash);
+
+
+				JSONObject message = new JSONObject();
+				try {
+					message.put("type","synch");
+					message.put("sender", myPort);
+					HashMap<String,String> synched = new HashMap<String, String>();
+					for(int j=0;j<targets.length;j++) {
+						if(!myLock.isHeldByCurrentThread()) {
+							throw new AssertionError("2_Lock has to be held while synching");
+						}
+						String result;
+						if(j==0 || j==1) {		//getting data from predecessors
+							message.put("role","slave");	//"role" is our role.
+							result = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(targets[j])).get();
+						} else {
+							message.put("role","peer");		//this is our replica(first successor). So, we're its coordinator
+							result = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(targets[j])).get();
+						}
+
+						if (result != null) {
+							//add contents of result into cursor
+							JSONArray keyValus = new JSONArray(result);
+							Log.d(TAG, "Synch: Received " + keyValus.length() + " entries from " + ring.get(targets[j]));
+							for (int i = 0; i < keyValus.length(); i++) {
+								JSONObject obj = keyValus.getJSONObject(i);
+								if (synched.get(obj.getString("key")) != null && !synched.get(obj.getString("key")).equals(obj.getString("value"))) {
+									Log.w(TAG, "Different values for key:" + obj.getString("key"));
+								}
+								//TODO: Compare versions somehow. synched is unused right now..
+
+								storeLocally(obj.getString("key"), obj.getString("value"),true);
+							}
+						}
+						else {
+							Log.e(TAG,"Faile to synch from "+targets[j]);
+						}
+					}
+					//combine result
+				} catch (JSONException e) {
+					e.printStackTrace();
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				} catch (ExecutionException e) {
+					e.printStackTrace();
+				}
 
 			}
 			else {
@@ -296,6 +324,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 		Log.e(TAG,"onCreate unlocking..");
 		myLock.unlock();
+
 		return true;
 	}
 
@@ -367,60 +396,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return false;
 	}
 
-	public void synch() {
-		//synch from both next server.
-		// Same as query * except this time we query only our next 2 guys, combine results and store them in our sharedprefs
-		if(!myLock.isHeldByCurrentThread()) {
-			throw new AssertionError("Lock has to be held while synching");
-		}
-		String[] targets = getSynchTargets(myHash);
 
-
-		JSONObject message = new JSONObject();
-		try {
-			message.put("type","synch");
-			message.put("sender", myPort);
-			HashMap<String,String> synched = new HashMap<String, String>();
-			for(int j=0;j<targets.length;j++) {
-				if(!myLock.isHeldByCurrentThread()) {
-					throw new AssertionError("2_Lock has to be held while synching");
-				}
-				String result;
-				if(j==0 || j==1) {		//getting data from predecessors
-					message.put("role","slave");	//"role" is our role.
-					result = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(targets[j])).get();
-				} else {
-					message.put("role","peer");		//this is our replica(first successor). So, we're its coordinator
-					result = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(targets[j])).get();
-				}
-
-				if (result != null) {
-					//add contents of result into cursor
-					JSONArray keyValus = new JSONArray(result);
-					Log.d(TAG, "Synch: Received " + keyValus.length() + " entries from " + ring.get(targets[j]));
-					for (int i = 0; i < keyValus.length(); i++) {
-						JSONObject obj = keyValus.getJSONObject(i);
-						if (synched.get(obj.getString("key")) != null && !synched.get(obj.getString("key")).equals(obj.getString("value"))) {
-							Log.w(TAG, "Different values for key:" + obj.getString("key"));
-						}
-						//TODO: Compare versions somehow. synched is unused right now..
-
-						storeLocally(obj.getString("key"), obj.getString("value"),true);
-					}
-				}
-				else {
-					Log.e(TAG,"Faile to synch from "+targets[j]);
-				}
-			}
-			//combine result
-		} catch (JSONException e) {
-			e.printStackTrace();
-		} catch (InterruptedException e) {
-			e.printStackTrace();
-		} catch (ExecutionException e) {
-			e.printStackTrace();
-		}
-	}
 	class KeyCount {
 		String keyStr;
 		int count;
@@ -545,57 +521,53 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		} else {	//local query for one object
 			Log.d(TAG,"Local query for "+selection);
-			String value = mPrefs.getString(selection,null);
-			if(value!=null)
-				cursor.addRow(new Object[]{selection,value});
-			else {	//contact all target nodes. Return the one with the latest version
-				String[] targets = getTargets(Util.genHash(selection));
-				try {
-					JSONObject message = new JSONObject();
-					message.put("key",selection);
-					message.put("sender",myPort);
-					message.put("type","singlequery");
-					HashMap<String, Integer> replies = new HashMap<String, Integer>();
-					for(String t:targets) {
-						Log.d(TAG,"Forwarding query to:"+t+":"+ring.get(t));
-						String reply = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t)).get();
-						if(reply!=null) {
-							//TODO: Compare latestReply with reply and update latestReply to be the actual latest version of teh retrieved data..
-							if(replies.containsKey(reply))
-								replies.put(reply,replies.get(reply)+1);	//increment count
-							else
-								replies.put(reply,1);	//first value here
+			//Always contact all target nodes. Return the one with the latest version
+			String[] targets = getTargets(Util.genHash(selection));
+			try {
+				JSONObject message = new JSONObject();
+				message.put("key",selection);
+				message.put("sender",myPort);
+				message.put("type","singlequery");
+				HashMap<String, Integer> replies = new HashMap<String, Integer>();
+				for(String t:targets) {
+					Log.d(TAG,"Forwarding query to:"+t+":"+ring.get(t));
+					String reply = new SendMessage().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), ring.get(t)).get();
+					if(reply!=null) {
+						//TODO: Compare latestReply with reply and update latestReply to be the actual latest version of teh retrieved data..
+						if(replies.containsKey(reply))
+							replies.put(reply,replies.get(reply)+1);	//increment count
+						else
+							replies.put(reply,1);	//first value here
 
-							Log.d(TAG,"Received "+selection+":"+reply+" from "+ring.get(t));
-						}
-						else {
-							Log.e(TAG,"SingleQuery response null");
-						}
+						Log.d(TAG,"Received "+selection+":"+reply+" from "+ring.get(t));
 					}
-					boolean majorityFound = false;
-					for(String k:replies.keySet()) {
-						if(replies.get(k)>=2) {
-							cursor.addRow(new Object[]{selection,k});
-							majorityFound = true;
-							break;
-						}
+					else {
+						Log.e(TAG,"SingleQuery response null");
 					}
-					if(!majorityFound) {
-						Log.e(TAG,"No key had a count of 2 or 3. Which means all keys were different. TThis is a problem!");
-						//pick the first "key" which is the first value we receive and put into cursor. Putting something is probabilistically better than putting nothing at all
-						for(String k:replies.keySet()) {
-								cursor.addRow(new Object[]{selection,k});
-								break;
-						}
-					}
-
-				} catch (JSONException e) {
-					e.printStackTrace();
-				} catch (InterruptedException e) {
-					e.printStackTrace();
-				} catch (ExecutionException e) {
-					e.printStackTrace();
 				}
+				boolean majorityFound = false;
+				for(String k:replies.keySet()) {
+					if(replies.get(k)>=2) {
+						cursor.addRow(new Object[]{selection,k});
+						majorityFound = true;
+						break;
+					}
+				}
+				if(!majorityFound) {
+					Log.e(TAG,"No key had a count of 2 or 3. Which means all keys were different. TThis is a problem!");
+					//pick the first "key" which is the first value we receive and put into cursor. Putting something is probabilistically better than putting nothing at all
+					for(String k:replies.keySet()) {
+						cursor.addRow(new Object[]{selection,k});
+						break;
+					}
+				}
+
+			} catch (JSONException e) {
+				e.printStackTrace();
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			} catch (ExecutionException e) {
+				e.printStackTrace();
 			}
 		}
 		Log.d(TAG,"Returning "+cursor.getCount()+" items");
@@ -692,16 +664,17 @@ public class SimpleDynamoProvider extends ContentProvider {
 			try {
 				while (true) {
 					Socket client = serverSocket.accept();
-					if(synchOn) {
-						Log.e(TAG,"AcceptMessage called while synch on");
-					}
-					Log.w(TAG,"Locking..current thread ID:"+Thread.currentThread().getId());
+					Log.w(TAG,"Locking..current thread ID:"+Thread.currentThread().getId()+" NumLocks held:"+myLock.getHoldCount());
 					if(myLock.isLocked()) {
 						Log.e(TAG,"Yeeah, onCreate holds a lock to myLock");
+					}
+					if(myLock.isHeldByCurrentThread()) {
+						Log.e(TAG,"AcceptMessage: We have lock even before locking it!");
 					}
 					myLock.lock();
 					Log.w(TAG,"Lock acquired");
 					myLock.unlock();
+
 					Log.d(TAG,"Accepted connection");
 					BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream(),"UTF-8"));
 					PrintWriter writer = new PrintWriter(new BufferedWriter(new OutputStreamWriter(client.getOutputStream(),"UTF-8")),true);
@@ -716,9 +689,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 							writer.println(obj.toString());
 						}
 						else if(received.getString("type").equals("query")) {
-							if(synchOn) {
-								Log.e(TAG,"Query received while synch on");
-							}
+
 							JSONObject reply = new JSONObject();
 							reply.put("content",fetchLocalData());
 							reply.put("type","query_reply");
@@ -728,9 +699,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 						}
 						else if(received.getString("type").equals("singlequery")) {
-							if(synchOn) {
-								Log.e(TAG,"single Query received while synch on");
-							}
+
 							JSONObject reply = new JSONObject();
 							reply.put("content",mPrefs.getString(received.getString("key"),null));
 							reply.put("type","singlequery_reply");
@@ -738,9 +707,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 						}
 						else if(received.getString("type").equals("synch")) {
-							if(synchOn) {
-								Log.e(TAG,"Synch request received while synch on");
-							}
+
 							Log.d(TAG,"Synch request from "+sender);
 							String returnedData;
 							if(received.getString("role").equals("slave"))	//role is the requestors role.
